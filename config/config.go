@@ -14,6 +14,14 @@ const (
 	defaultConfigFile = "config.yaml"
 )
 
+// MCPServerConfig holds configuration for a single MCP server
+type MCPServerConfig struct {
+	Name      string            `yaml:"name"`
+	Command   string            `yaml:"command"`
+	Arguments []string          `yaml:"arguments"`
+	Env       map[string]string `yaml:"env,omitempty"`
+}
+
 // Config holds the complete configuration for the bridge
 type Config struct {
 	LLM struct {
@@ -23,10 +31,7 @@ type Config struct {
 		SystemPrompt string `yaml:"system_prompt"`
 	} `yaml:"llm"`
 
-	MCP struct {
-		Command   string   `yaml:"command"`
-		Arguments []string `yaml:"arguments"`
-	} `yaml:"mcp"`
+	MCPServers []MCPServerConfig `yaml:"mcp_servers"`
 
 	Database struct {
 		Path string `yaml:"path"`
@@ -50,7 +55,7 @@ func DefaultConfig() *Config {
 
 	// LLM defaults
 	cfg.LLM.Model = "qwen2.5-coder-7b-instruct-128k:q6_k"
-	cfg.LLM.Endpoint = "http://localhost:11434/api/chat"
+	cfg.LLM.Endpoint = "http://localhost:11434/api"
 	cfg.LLM.SystemPrompt = `You are a helpful assistant with access to various tools.
 
 [Tools]
@@ -58,11 +63,33 @@ When using the database tool:
 1. Use exact column names from the schema
 2. Write valid SQL queries
 3. Remember this is SQLite
-`
 
-	// MCP defaults
-	cfg.MCP.Command = "uvx"
-	cfg.MCP.Arguments = []string{"mcp-server-sqlite", "--db-path", "test.db"}
+When using bybit tools:
+1. All amounts are in USD
+2. Follow proper position sizing and risk management
+3. Always verify order details before execution`
+
+	// Default MCP servers
+	cfg.MCPServers = []MCPServerConfig{
+		{
+			Name:      "sqlite",
+			Command:   "uvx",
+			Arguments: []string{"mcp-server-sqlite", "--db-path", "test.db"},
+		},
+		{
+			Name:    "bybit",
+			Command: "/bin/sh",
+			Arguments: []string{
+				"-c",
+				"pnpm run serve", // User must configure the correct path in their config file
+			},
+			Env: map[string]string{
+				"BYBIT_API_KEY":       "", // Add your Bybit API **READ ONLY** key here
+				"BYBIT_API_SECRET":    "", // Add your Bybit API **READ ONLY** secret here
+				"BYBIT_USE_TESTNET":   "true",
+			},
+		},
+	}
 
 	// Database defaults
 	cfg.Database.Path = "test.db"
@@ -185,8 +212,16 @@ func (c *Config) validate() error {
 	}
 
 	// Required MCP fields
-	if c.MCP.Command == "" {
-		return fmt.Errorf("mcp.command is required")
+	if len(c.MCPServers) == 0 {
+		return fmt.Errorf("at least one MCP server configuration is required")
+	}
+	for i, server := range c.MCPServers {
+		if server.Name == "" {
+			return fmt.Errorf("mcp_servers[%d].name is required", i)
+		}
+		if server.Command == "" {
+			return fmt.Errorf("mcp_servers[%d].command is required", i)
+		}
 	}
 
 	// Required Database fields

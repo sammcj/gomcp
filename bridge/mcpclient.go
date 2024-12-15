@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,6 +24,11 @@ type MCPClient struct {
 	mu       sync.Mutex
 	nextID   int64
 	respChan chan []byte
+}
+
+// isDevelopmentModeWarning checks if a message is a development mode warning
+func isDevelopmentModeWarning(msg string) bool {
+	return strings.Contains(msg, "Running in development mode")
 }
 
 func NewMCPClient(command string, args []string, logger *log.Logger) (*MCPClient, error) {
@@ -87,7 +93,10 @@ func NewMCPClient(command string, args []string, logger *log.Logger) (*MCPClient
 	if err != nil {
 		logger.Printf("Failed to read stderr: %v", err)
 	} else if len(stderrBytes) > 0 {
-		logger.Printf("MCP server stderr output: %s", string(stderrBytes))
+		// Only log stderr if it's not a development mode warning
+		if !isDevelopmentModeWarning(string(stderrBytes)) {
+			logger.Printf("MCP server stderr output: %s", string(stderrBytes))
+		}
 	}
 
 	// Send a test request to verify server is working
@@ -139,16 +148,36 @@ func (c *MCPClient) readResponses() {
 			return
 		}
 
-		c.logger.Printf("Raw response: %s", string(line))
-
-		// Try to parse as JSON to ensure it's a complete message
-		var msg map[string]interface{}
-		if err := json.Unmarshal(line, &msg); err != nil {
-			c.logger.Printf("Invalid JSON response: %v", err)
+		// Skip empty lines
+		if len(line) == 0 {
 			continue
 		}
 
-		c.respChan <- line
+		// Try to parse as JSON
+		var msg map[string]interface{}
+		if err := json.Unmarshal(line, &msg); err != nil {
+			// Skip non-JSON lines (e.g., pnpm startup messages)
+			continue
+		}
+
+		// Handle notifications separately
+		if _, hasMethod := msg["method"]; hasMethod {
+			if method, ok := msg["method"].(string); ok && method == "notify" {
+				if params, ok := msg["params"].(map[string]interface{}); ok {
+					// Only log notifications that aren't development mode warnings
+					if !isDevelopmentModeWarning(fmt.Sprintf("%v", params)) {
+						c.logger.Printf("Notification received: %+v", params)
+					}
+				}
+				continue
+			}
+		}
+
+		// Only log and forward actual responses
+		if _, hasResult := msg["result"]; hasResult {
+			c.logger.Printf("Response received: %s", string(line))
+			c.respChan <- line
+		}
 	}
 }
 
@@ -159,8 +188,17 @@ func (c *MCPClient) Initialize(ctx context.Context, req mcp.InitializeRequest) (
 	rpcReq := map[string]interface{}{
 		"jsonrpc": "2.0",
 		"id":      c.nextID,
-		"method":  "tools/list", // Start with listing tools
-		"params":  map[string]interface{}{},
+		"method":  "initialize",
+		"params": map[string]interface{}{
+			"protocolVersion": "1.0.0",
+			"capabilities": map[string]interface{}{
+				"experimental": map[string]interface{}{},
+			},
+			"clientInfo": map[string]interface{}{
+				"name":    "gomcp",
+				"version": "0.1.0",
+			},
+		},
 	}
 	c.nextID++
 

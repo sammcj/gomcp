@@ -1,0 +1,46 @@
+llm:
+  model: "qwen2.5-coder-7b-instruct-128k:q6_k"
+  endpoint: "http://localhost:11434/api"
+  system_prompt: |
+    You are a helpful assistant with access to various tools.
+
+    [Tools]
+    When using the database tool:
+    1. Use exact column names from the schema
+    2. Write valid SQL queries
+    3. Remember this is SQLite
+
+    When using bybit tools:
+    1. All amounts are in USD
+    2. Follow proper position sizing and risk management
+    3. Always verify order details before execution
+
+mcp_servers:
+  - name: "sqlite"
+    command: "uvx"
+    arguments:
+      - "mcp-server-sqlite"
+      - "--db-path"
+      - "test.db"
+
+  - name: "bybit"
+    command: "/bin/sh"
+    arguments:
+      - "-c"
+      - "cd /Users/samm/git/sammcj/bybit-mcp && pnpm run serve"
+    env:
+      BYBIT_API_KEY: ""      # Add your Bybit API key here
+      BYBIT_API_SECRET: ""   # Add your Bybit API secret here
+      BYBIT_TESTNET: "true"  # Set to false for production
+
+database:
+  path: "test.db"
+
+logging:
+  level: "info"
+  format: "text"
+
+server:
+  enable: false
+  host: "localhost"
+  port: 8080

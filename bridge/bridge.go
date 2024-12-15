@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -23,11 +25,13 @@ type Bridge struct {
 	cancel    context.CancelFunc
 	llmClient *llm.Client
 	tools     []mcp.Tool
-	toolMap   map[string]string
+	toolMap   map[string]string     // Maps sanitized tool names to original names
+	serverMap map[string]*MCPClient // Maps server names to their clients
 	dbTool    *tools.DatabaseTool
 	logger    *log.Logger
 	config    *config.Config
 	debug     bool
+	mu        sync.RWMutex
 }
 
 // New creates a new Bridge instance
@@ -60,14 +64,14 @@ func New(cfg *config.Config, logger *log.Logger) (*Bridge, error) {
 		return nil, &types.BridgeError{
 			Operation: "create_db_tool",
 			Message:   "failed to create database tool",
-			Err:      err,
+			Err:       err,
 		}
 	}
 	if debug {
 		logger.Println("Database tool created successfully")
 	}
 
-	// Create tool definition
+	// Create tool definition for database
 	queryTool := mcp.Tool{
 		Name:        "query_database",
 		Description: "Execute a SQL query against the SQLite database",
@@ -89,6 +93,7 @@ func New(cfg *config.Config, logger *log.Logger) (*Bridge, error) {
 		llmClient: llmClient,
 		tools:     []mcp.Tool{queryTool},
 		toolMap:   make(map[string]string),
+		serverMap: make(map[string]*MCPClient),
 		dbTool:    dbTool,
 		logger:    logger,
 		config:    cfg,
@@ -101,21 +106,77 @@ func New(cfg *config.Config, logger *log.Logger) (*Bridge, error) {
 	return bridge, nil
 }
 
-// Initialize sets up the bridge
+// Initialize sets up the bridge and connects to all configured MCP servers
 func (b *Bridge) Initialize() error {
 	if b.debug {
 		b.logger.Println("Starting bridge initialization...")
 	}
 
-	// Register tools
+	// Register built-in tools
 	if b.debug {
-		b.logger.Println("Registering tools...")
+		b.logger.Println("Registering built-in tools...")
 	}
 	b.toolMap["query_database"] = "query_database"
 
+	// Initialize MCP servers
+	if b.debug {
+		b.logger.Printf("Initializing %d MCP servers...", len(b.config.MCPServers))
+	}
+
+	for _, serverCfg := range b.config.MCPServers {
+		if b.debug {
+			b.logger.Printf("Initializing MCP server: %s", serverCfg.Name)
+		}
+
+		// Create client with environment variables
+		client, err := NewMCPClient(serverCfg.Command, serverCfg.Arguments, b.logger)
+		if err != nil {
+			return fmt.Errorf("failed to create MCP client for %s: %w", serverCfg.Name, err)
+		}
+
+		// Initialize the client
+		if b.debug {
+			b.logger.Printf("Initializing MCP client for %s...", serverCfg.Name)
+		}
+		_, err = client.Initialize(b.ctx, mcp.InitializeRequest{})
+		if err != nil {
+			client.Close()
+			return fmt.Errorf("failed to initialize MCP client for %s: %w", serverCfg.Name, err)
+		}
+
+		// List tools from the server
+		if b.debug {
+			b.logger.Printf("Listing tools for %s...", serverCfg.Name)
+		}
+		toolsResult, err := client.ListTools(b.ctx, mcp.ListToolsRequest{})
+		if err != nil {
+			client.Close()
+			return fmt.Errorf("failed to list tools for %s: %w", serverCfg.Name, err)
+		}
+
+		// Register server's tools
+		for _, tool := range toolsResult.Tools {
+			sanitizedName := sanitizeToolName(tool.Name)
+			b.toolMap[sanitizedName] = fmt.Sprintf("%s/%s", serverCfg.Name, tool.Name)
+			b.tools = append(b.tools, tool)
+			if b.debug {
+				b.logger.Printf("Registered tool %s from server %s", tool.Name, serverCfg.Name)
+			}
+		}
+
+		// Store the client
+		b.mu.Lock()
+		b.serverMap[serverCfg.Name] = client
+		b.mu.Unlock()
+
+		if b.debug {
+			b.logger.Printf("MCP server %s initialized with %d tools", serverCfg.Name, len(toolsResult.Tools))
+		}
+	}
+
 	// Set tools in LLM client
 	if b.debug {
-		b.logger.Println("Setting tools in LLM client...")
+		b.logger.Printf("Setting %d tools in LLM client...", len(b.tools))
 	}
 	if err := b.llmClient.SetTools(b.tools); err != nil {
 		return fmt.Errorf("failed to set tools in LLM client: %w", err)
@@ -167,7 +228,7 @@ func (b *Bridge) ProcessMessage(msg string) (string, error) {
 		return "", &types.BridgeError{
 			Operation: "process_message",
 			Message:   "failed after retry attempts",
-			Err:      err,
+			Err:       err,
 		}
 	}
 
@@ -181,7 +242,7 @@ func (b *Bridge) ProcessMessage(msg string) (string, error) {
 			return "", &types.BridgeError{
 				Operation: "handle_tools",
 				Message:   "tool execution failed",
-				Err:      err,
+				Err:       err,
 			}
 		}
 
@@ -203,7 +264,7 @@ func (b *Bridge) handleToolCalls(toolCalls []types.ToolCall) ([]map[string]inter
 	var results []map[string]interface{}
 
 	for _, call := range toolCalls {
-		// Get original tool name
+		// Get original tool name and server
 		mcpName, ok := b.toolMap[call.Function.Name]
 		if !ok {
 			if b.debug {
@@ -212,30 +273,60 @@ func (b *Bridge) handleToolCalls(toolCalls []types.ToolCall) ([]map[string]inter
 			return nil, fmt.Errorf("unknown tool: %s", call.Function.Name)
 		}
 
-		// Execute tool directly
-		var result interface{}
-		var err error
-
+		// Handle built-in database tool
 		if mcpName == "query_database" {
-			query, ok := call.Function.Arguments["query"].(string)
-			if !ok {
-				if b.debug {
-					b.logger.Printf("Invalid query argument: %v", call.Function.Arguments)
-				}
-				return nil, fmt.Errorf("invalid query argument")
+			result, err := b.handleDatabaseTool(call)
+			if err != nil {
+				return nil, err
 			}
-
-			if b.debug {
-				b.logger.Printf("Executing database query: %s", query)
-			}
-			result, err = b.dbTool.Execute(map[string]interface{}{"query": query})
-		} else {
-			if b.debug {
-				b.logger.Printf("Unknown tool: %s", mcpName)
-			}
-			return nil, fmt.Errorf("unknown tool: %s", mcpName)
+			results = append(results, result)
+			continue
 		}
 
+		// Parse server and tool name
+		parts := strings.SplitN(mcpName, "/", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid tool mapping: %s", mcpName)
+		}
+		serverName, toolName := parts[0], parts[1]
+
+		// Get the MCP client
+		b.mu.RLock()
+		client, ok := b.serverMap[serverName]
+		b.mu.RUnlock()
+		if !ok {
+			return nil, fmt.Errorf("unknown MCP server: %s", serverName)
+		}
+
+		// Convert numeric arguments to strings for enum fields
+		convertedArgs := make(map[string]interface{})
+		for k, v := range call.Function.Arguments {
+			switch val := v.(type) {
+			case float64:
+				// Convert numeric values to strings for known numeric enum fields
+				if k == "limit" || k == "interval" {
+					convertedArgs[k] = fmt.Sprintf("%v", val)
+				} else {
+					convertedArgs[k] = val
+				}
+			default:
+				convertedArgs[k] = val
+			}
+		}
+
+		// Execute the tool with converted arguments
+		if b.debug {
+			b.logger.Printf("Executing tool %s on server %s with arguments: %v", toolName, serverName, convertedArgs)
+		}
+		result, err := client.CallTool(b.ctx, mcp.CallToolRequest{
+			Params: struct {
+				Name      string                 `json:"name"`
+				Arguments map[string]interface{} `json:"arguments,omitempty"`
+			}{
+				Name:      toolName,
+				Arguments: convertedArgs,
+			},
+		})
 		if err != nil {
 			if b.debug {
 				b.logger.Printf("Tool execution failed: %v", err)
@@ -243,68 +334,8 @@ func (b *Bridge) handleToolCalls(toolCalls []types.ToolCall) ([]map[string]inter
 			return nil, fmt.Errorf("tool execution failed: %w", err)
 		}
 
-		// Format the result for better readability
-		var formattedResult string
-		switch v := result.(type) {
-		case []map[string]interface{}:
-			if len(v) > 0 {
-				// Get column names from the first row and sort them logically
-				columns := []string{"id", "user_id", "product", "price", "created_at"}
-
-				// Calculate column widths
-				colWidths := make(map[string]int)
-				for _, col := range columns {
-					colWidths[col] = len(col)
-					for _, row := range v {
-						if val, ok := row[col]; ok {
-							width := len(fmt.Sprintf("%v", val))
-							if width > colWidths[col] {
-								colWidths[col] = width
-							}
-						}
-					}
-				}
-
-				// Build header
-				var sb strings.Builder
-				for _, col := range columns {
-					sb.WriteString(fmt.Sprintf("%-*s  ", colWidths[col], strings.ToUpper(col)))
-				}
-				sb.WriteString("\n")
-
-				// Add separator line
-				for _, col := range columns {
-					sb.WriteString(strings.Repeat("-", colWidths[col]))
-					sb.WriteString("  ")
-				}
-				sb.WriteString("\n")
-
-				// Add data rows
-				for _, row := range v {
-					for _, col := range columns {
-						if val, ok := row[col]; ok {
-							sb.WriteString(fmt.Sprintf("%-*v  ", colWidths[col], val))
-						} else {
-							sb.WriteString(fmt.Sprintf("%-*s  ", colWidths[col], ""))
-						}
-					}
-					sb.WriteString("\n")
-				}
-
-				formattedResult = sb.String()
-			}
-		default:
-			// For other types, use standard JSON marshaling
-			jsonData, err := json.MarshalIndent(result, "", "  ")
-			if err != nil {
-				if b.debug {
-					b.logger.Printf("Failed to marshal result: %v", err)
-				}
-				return nil, fmt.Errorf("failed to marshal result: %w", err)
-			}
-			formattedResult = string(jsonData)
-		}
-
+		// Format the result
+		formattedResult := b.formatToolResult(result)
 		results = append(results, map[string]interface{}{
 			"tool_call_id": call.ID,
 			"output":       formattedResult,
@@ -314,17 +345,159 @@ func (b *Bridge) handleToolCalls(toolCalls []types.ToolCall) ([]map[string]inter
 	return results, nil
 }
 
+// handleDatabaseTool processes database tool calls
+func (b *Bridge) handleDatabaseTool(call types.ToolCall) (map[string]interface{}, error) {
+	query, ok := call.Function.Arguments["query"].(string)
+	if !ok {
+		if b.debug {
+			b.logger.Printf("Invalid query argument: %v", call.Function.Arguments)
+		}
+		return nil, fmt.Errorf("invalid query argument")
+	}
+
+	if b.debug {
+		b.logger.Printf("Executing database query: %s", query)
+	}
+	result, err := b.dbTool.Execute(map[string]interface{}{"query": query})
+	if err != nil {
+		return nil, fmt.Errorf("database query failed: %w", err)
+	}
+
+	formattedResult := b.formatDatabaseResult(result)
+	return map[string]interface{}{
+		"tool_call_id": call.ID,
+		"output":       formattedResult,
+	}, nil
+}
+
+// formatToolResult formats the result from an MCP tool call
+func (b *Bridge) formatToolResult(result *mcp.CallToolResult) string {
+	if result == nil || len(result.Content) == 0 {
+		return ""
+	}
+
+	var output strings.Builder
+	for _, content := range result.Content {
+		switch v := content.(type) {
+		case map[string]interface{}:
+			if text, ok := v["text"].(string); ok {
+				output.WriteString(text)
+				output.WriteString("\n")
+			} else if data, err := json.MarshalIndent(v, "", "  "); err == nil {
+				output.Write(data)
+				output.WriteString("\n")
+			}
+		default:
+			if data, err := json.MarshalIndent(v, "", "  "); err == nil {
+				output.Write(data)
+				output.WriteString("\n")
+			}
+		}
+	}
+	return strings.TrimSpace(output.String())
+}
+
+// formatDatabaseResult formats database query results
+func (b *Bridge) formatDatabaseResult(result interface{}) string {
+	switch v := result.(type) {
+	case []map[string]interface{}:
+		if len(v) == 0 {
+			return ""
+		}
+
+		// Get all unique column names from all rows
+		columnSet := make(map[string]struct{})
+		for _, row := range v {
+			for col := range row {
+				columnSet[col] = struct{}{}
+			}
+		}
+
+		// Convert to sorted slice
+		var columns []string
+		for col := range columnSet {
+			columns = append(columns, col)
+		}
+		sort.Strings(columns)
+
+		// Calculate column widths
+		colWidths := make(map[string]int)
+		for _, col := range columns {
+			colWidths[col] = len(col)
+			for _, row := range v {
+				if val, ok := row[col]; ok {
+					width := len(fmt.Sprintf("%v", val))
+					if width > colWidths[col] {
+						colWidths[col] = width
+					}
+				}
+			}
+		}
+
+		// Build formatted output
+		var sb strings.Builder
+
+		// Header
+		for _, col := range columns {
+			sb.WriteString(fmt.Sprintf("%-*s  ", colWidths[col], strings.ToUpper(col)))
+		}
+		sb.WriteString("\n")
+
+		// Separator
+		for _, col := range columns {
+			sb.WriteString(strings.Repeat("-", colWidths[col]))
+			sb.WriteString("  ")
+		}
+		sb.WriteString("\n")
+
+		// Data rows
+		for _, row := range v {
+			for _, col := range columns {
+				if val, ok := row[col]; ok {
+					sb.WriteString(fmt.Sprintf("%-*v  ", colWidths[col], val))
+				} else {
+					sb.WriteString(fmt.Sprintf("%-*s  ", colWidths[col], ""))
+				}
+			}
+			sb.WriteString("\n")
+		}
+
+		return sb.String()
+	default:
+		// For other types, use standard JSON marshaling
+		jsonData, err := json.MarshalIndent(result, "", "  ")
+		if err != nil {
+			if b.debug {
+				b.logger.Printf("Failed to marshal result: %v", err)
+			}
+			return fmt.Sprintf("Error formatting result: %v", err)
+		}
+		return string(jsonData)
+	}
+}
+
 // Close cleans up resources
 func (b *Bridge) Close() error {
 	b.cancel()
 
 	var errs []error
 
+	// Close database tool
 	if err := b.dbTool.Close(); err != nil {
 		errs = append(errs, fmt.Errorf("database tool: %w", err))
 	}
 
-	// Clear maps and slices
+	// Close all MCP clients
+	b.mu.Lock()
+	for name, client := range b.serverMap {
+		if err := client.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("MCP server %s: %w", name, err))
+		}
+	}
+	b.serverMap = nil
+	b.mu.Unlock()
+
+	// Clear other resources
 	b.toolMap = nil
 	b.tools = nil
 
